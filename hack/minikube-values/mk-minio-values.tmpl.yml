@@ -1,0 +1,12 @@
+# Copyright VMware, Inc.
+# SPDX-License-Identifier: APACHE-2.0
+
+## MinIO&reg; authentication parameters
+##
+auth:
+  ## @param auth.rootUser MinIO&reg; root username
+  ##
+  rootUser: "$MINIO_ROOTUSER"
+  ## @param auth.rootPassword Password for MinIO&reg; root user
+  ##
+  rootPassword: "$MINIO_ROOTPASSWORD"

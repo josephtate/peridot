@@ -39,6 +39,8 @@ targets=(
   "//peridot/cmd/v1/yumrepofsupdater/ci:yumrepofsupdater.push_apply"
 )
 
+BR_PATH="${BASH_SOURCE[0]%/*}/br"
+
 for target in "${targets[@]}"; do
-  br "$target"
+  $BR_PATH "$target"
 done

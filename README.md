@@ -32,10 +32,11 @@ https://istio.io/latest/docs/setup/getting-started/
 #### Initial setup (will soon be replaced by one command dev cluster)
 ```bash
 # In the directory where you downloaded istio
-bin/istioctl install --set profile=default --set hub=docker.io/querycapistio --set tag=1.12.1 -y
+bin/istioctl install --set profile=default --set hub=docker.io/querycapistio --set tag=1.20.3 -y
 # On aarch64 (ex. M1 Mac) only and add arm64 to list of preferred schedule archs
 # Run this while install is running
 kubectl -n istio-system edit deployment istio-ingressgateway
+# TODO WHAT CHANGES ARE NECESSARY HERE IN THIS EDIT?
 sudo hack/deploy_dev_registry
 hack/setup_external_dev_services
 # Run `kubectl get svc` and add the port of postgres-postgresql to your rc file

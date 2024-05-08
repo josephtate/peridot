@@ -1,0 +1,57 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: temporal-admin-tools
+  namespace: default
+spec:
+  template:
+    spec:
+      containers:
+      - name: temporal-create-schema
+        image: temporalio/admin-tools
+        command:
+        - "/bin/bash"
+        - "-c"
+        - |
+          set -x
+          echo "Waiting for DB to be ready"
+          for i in {1..6}
+          do
+            if pg_isready -h $PGHOST -p 5432 -U $TEMPORAL_PGUSER
+            then
+              echo "DB is ready"
+              break
+            fi
+            echo "DB is not ready yet"
+            sleep 5
+          done
+          export SQL_PLUGIN="postgres12"
+          export SQL_HOST="$PGHOST"
+          export SQL_PORT=5432
+          export SQL_USER="$TEMPORAL_PGUSER"
+          export SQL_PASSWORD="$TEMPORAL_PGPASSWORD"
+          echo "Creating schema for Temporal"
+          SQL_DATABASE=${TEMPORAL_PGDATABASE} temporal-sql-tool setup-schema -version v0.0
+          SQL_DATABASE=${TEMPORAL_PGDATABASE} temporal-sql-tool update -schema-dir \
+            schema/postgresql/v12/temporal/versioned
+
+          SQL_DATABASE=${TEMPORAL_PGDATABASE}_visibility temporal-sql-tool setup-schema -version v0.0
+          SQL_DATABASE=${TEMPORAL_PGDATABASE}_visibility temporal-sql-tool update -schema-dir \
+            schema/postgresql/v12/visibility/versioned
+
+          echo "Schema created"
+          echo "Set up temporal namespace"
+          for i in {1..6}
+          do
+            if nc -z temporal-frontend 7233
+            then
+              echo "temporal-frontend ready for connections"
+              break
+            else
+              sleep 30
+            fi
+          done
+          tctl --address temporal-frontend:7233 --namespace default namespace re
+          echo "Namespace ready"
+      restartPolicy: OnFailure
+  backoffLimit: 4

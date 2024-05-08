@@ -32,7 +32,14 @@
 #
 
 # This script deploys hydra and spicedb
-ARCH="$(hack/get_arch)"
-bazel run --platforms @io_bazel_rules_go//go/toolchain:linux_"$ARCH" //hydra/deploy/public:public.apply
-bazel run --platforms @io_bazel_rules_go//go/toolchain:linux_"$ARCH" //hydra/deploy/admin:admin.apply
-bazel run --platforms @io_bazel_rules_go//go/toolchain:linux_"$ARCH" //spicedb/deploy:spicedb.apply
+targets=(
+  "//hydra/deploy/public:public.apply"
+  "//hydra/deploy/admin:admin.apply"
+  "//spicedb/deploy:spicedb.apply"
+)
+
+BR_PATH="${BASH_SOURCE[0]%/*}/br"
+
+for target in "${targets[@]}"; do
+  $BR_PATH "$target"
+done

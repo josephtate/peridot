@@ -30,10 +30,17 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 #
+set -x
 
 ARCH="$2"
 if [[ -z "$ARCH" ]]; then
-  ARCH="$(get_arch)"
+  ARCH="$(${BASH_SOURCE[0]%/*}/get_arch)"
+fi
+
+if which bazelisk > /dev/null; then
+  BAZEL=bazelisk
+else
+  BAZEL=bazel
 fi
 
 PLATFORM="@io_bazel_rules_go//go/toolchain:linux_$ARCH"
@@ -41,4 +48,4 @@ if [[ -n "$3" || "$1" == *"frontend"* ]]; then
   PLATFORM="@build_bazel_rules_nodejs//toolchains/node:linux_$ARCH"
 fi
 
-bazel run --platforms "$PLATFORM" "$1"
+$BAZEL run --platforms "$PLATFORM" "$1"

@@ -1,0 +1,6 @@
+hydra:
+  config:
+    ttl:
+      access_token: 1h
+    autoMigrate: true
+    dev: true

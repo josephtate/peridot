@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+#
+# Copyright (c) All respective contributors to the Peridot Project. All rights reserved.
+# Copyright (c) 2021-2024 Rocky Enterprise Software Foundation, Inc. All rights reserved.
+# Copyright (c) 2021-2024 Ctrl IQ, Inc. All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice,
+# this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its contributors
+# may be used to endorse or promote products derived from this software without
+# specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+# LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+#
+
+set -e
+
+# NOTE: This assumes minikube is present and running, and that you've "started" a cluster with at least 4 CPUs and 8GB
+# There are several assumptions about minikube, namespaces, and cluster domain, so please do not modify those when
+# creating your cluster.
+# memory, E.g., minikube start --cpus=4 --memory=8g
+
+# RECOMMENDED: install the kube-ns krew plugin
+
+#Comment this out to do all tmp file cleanups and leave echo off
+export DEBUG=1
+
+if [ "${DEBUG:-0}" -gt 0 ]
+then
+    set -x
+fi
+
+# Figure out the current namespace from kubectl-ns if present
+DEFAULT_KS_NS=default
+export K_NS=$(kubectl-ns -c || echo "${DEFAULT_KS_NS}")
+#
+# All kubernetes operations will be done on this namespace
+
+# GLOBAL SETTINGS - Settings for the various setups
+#  PostgreSQL variables
+export PGPASSWORD=postgres
+export PGUSER=postgres
+# Configure this to match your k8s node address, or localhost if your K8s nodeports are port forwarded to localhost
+export PGHOST=postgres-postgresql.$K_NS
+export PGDATABASE=postgresdev
+# between 30000 and 32783
+export PGPORT=32321
+
+export TEMPORAL_PGUSER=temporal
+export TEMPORAL_PGPASSWORD=temporal123
+export TEMPORAL_PGDATABASE=temporal
+
+#  Minio variables
+export MINIO_ROOTUSER=admin
+export MINIO_ROOTPW=minioadmin
+
+WORKDIR=$(mktemp -d --suffix "-$(basename ${BASH_SOURCE[0]})")
+SCRIPTDIR=${BASH_SOURCE[0]%/*}
+VALUES_DIR=$SCRIPTDIR/minikube-values
+
+function mk_addon_enabled {
+    local addon
+    addon=$1
+
+    minikube addons list | grep 'enabled' | grep $addon
+}
+
+# The storage addons are default
+#mk_addon_enabled storage-provisioner || minikube addons enable storage-provisioner
+#mk_addon_enabled default-storageclass || minikube addons enable default-storageclass
+
+# TODO: SET THIS UP mk_addon_enabled registry || minikube addons enable registry
+# The provisioner must be enabled first to avoid a hung install
+# mk_addon_enabled istio-provisioner || minikube addons enable istio-provisioner
+# mk_addon_enabled istio || minikube addons enable istio
+
+#cleanup function
+function cleanup {
+    if [ "${DEBUG:-0}" -gt 0 ]
+    then
+        echo "Temporary files at $WORKDIR were not removed due to DEBUG flag"
+    else
+        rm -rf "$WORKDIR"
+        echo "Deleted temporary working directory $WORKDIR"
+    fi
+}
+
+# Register the cleanup function
+trap cleanup EXIT
+
+function random_str {
+    local len charlist
+
+    len=$1
+    charlist="${2:-'[:alnum:]'}"
+    LC_ALL=C tr -dc "$charlist" < /dev/urandom | head -c $len
+}
+
+function debug_echo {
+    if [ "${DEBUG:-0}" -gt 0 ]
+    then
+        echo "$@" >&2
+    fi
+}
+
+function debug_cat {
+    if [ "${DEBUG:-0}" -gt 0 ]
+    then
+        cat "$@" >&2
+    fi
+}
+
+function templ_sub {
+    local tmpl output
+
+    tmpl=$1
+    output=$2
+
+    envsubst < "$tmpl" > "$output"
+
+    debug_echo "The templated values file"
+    debug_cat $output
+}
+
+
+# Install postgres
+helm repo add bitnami https://charts.bitnami.com/bitnami
+
+# Documentation and source of the used chart with all configuration parameters:
+# https://artifacthub.io/packages/helm/bitnami/postgresql
+# https://github.com/helm/charts/tree/master/stable/postgresql
+
+# The postgresql helm chart requires the cluster to provide a PersistentVolume or a StorageClass and places a
+# PersisentVolumeClaim for this.
+# Ensure that the cluster provides PersistentVolumes:
+
+
+if [ $(kubectl get sc --no-headers | grep default | wc -l) -ge 1 ]
+then
+    echo "Storage prerequisites have been met"
+else
+    cat <<EOF
+The postgresql helm chart has a PersistentVolumeClaim (PVC). The cluster needs to provide a way for that to be
+provisioned. For this script, we assume a hostpath style Storage Class has been set up and flagged as default. For
+minikube, this is automatic.
+EOF
+    exit 5
+fi
+
+# TODO shift credentials to a secret of some sort for production
+
+# Run the templating on the values file
+templ_sub $VALUES_DIR/mk-postgres-values.tmpl.yml "$WORKDIR/mk-postgres-values.yml"
+
+helm upgrade -n "$K_NS" --install postgres bitnami/postgresql --values "$WORKDIR/mk-postgres-values.yml"
+
+cat <<EOF
+You can connect to your postgres database using the following command:
+
+   kubectl run postgres-postgresql-client --rm --tty -i --restart='Never' --namespace $K_NS --image docker.io/bitnami/postgresql:16.2.0-debian-12-r5 --env="PGPASSWORD=$PGPASSWORD" --command -- psql --host postgres-postgresql -U $PGUSER -d $PGDATABASE -p 5432 -n
+
+For convenience, you may want to set an alias:
+
+   alias psql='kubectl run postgres-postgresql-client --rm --tty -i --restart='Never' --namespace $K_NS --image docker.io/bitnami/postgresql:16.2.0-debian-12-r5 --env="PGPASSWORD=$PGPASSWORD" --command -- psql --host postgres-postgresql -U $PGUSER -d $PGDATABASE -p 5432 -n'
+
+EOF
+
+#sleep 10
+
+# Install localstack (TODO What is localstack for?)
+helm repo add localstack-repo https://helm.localstack.cloud
+helm upgrade -n "$K_NS" --install localstack localstack-repo/localstack
+
+
+# Install minio (TODO What is minio used for?)
+
+# TODO shift credentials to a secret of some sort for production
+
+# Set up the values file
+templ_sub $VALUES_DIR/mk-minio-values.tmpl.yml "$WORKDIR/mk-minio-values.yml"
+
+# Documentation and source of the used chart with all configuration parameters:
+# https://artifacthub.io/packages/helm/bitnami/minio
+# https://github.com/helm/charts/tree/master/stable/minio
+
+helm upgrade -n "$K_NS" --install minio bitnami/minio --values "$WORKDIR/mk-minio-values.yml"
+
+# Install the vendored temporal helm chart (TODO Why did this get vendored? Can it be replaced? What is it for?)
+# Figure out where we are, and then where the infrastructure/dev-helm/ path is
+
+# Set up the temporal user and databases
+
+helm repo add temporal https://go.temporal.io/helm-charts
+
+templ_sub $VALUES_DIR/mk-temporal-values.tmpl.yml "$WORKDIR/mk-temporal-values.yml"
+
+# the databases are already set up, now setup the schemas
+templ_sub $VALUES_DIR/temporal-schema-job.tmpl.yml "$WORKDIR/temporal-schema-job.yml"
+kubectl apply -n "$K_NS" -f "$WORKDIR/temporal-schema-job.yml"
+
+helm upgrade -n "$K_NS" --install temporal temporal/temporal --timeout 15m -f "$WORKDIR/mk-temporal-values.yml"
+
+# Install hydra
+helm repo add ory https://k8s.ory.sh/helm/charts
+
+kubectl create ns initdb-dev
+kubectl -n initdb-dev create secret generic initdb-password --from-literal=password=$PGPASSWORD
+
+kubectl create ns "$USER-dev"
+
+kubectl -n "$USER-dev" create secret generic hydra --from-literal=secretsSystem="$(random_str 48)" --from-literal=secretsCookie="$(random_str 48)" --from-literal=dsn="postgres://$PGUSER:$PGPASSWORD@$PGHOST:$PGPORT/hydradev?sslmode=enable"
+
+# helm install -n "$USER-dev" hydra-public --set hydra.existingSecret=hydra ory/hydra
