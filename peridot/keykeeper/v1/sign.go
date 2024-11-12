@@ -31,13 +31,19 @@
 package keykeeperv1
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+
 	"github.com/google/uuid"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
@@ -46,23 +52,38 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/anypb"
-	"io"
-	"io/ioutil"
-	"os"
-	"os/exec"
-	"path/filepath"
 	peridotworkflow "peridot.resf.org/peridot/builder/v1/workflow"
 	"peridot.resf.org/peridot/db/models"
 	keykeeperpb "peridot.resf.org/peridot/keykeeper/pb"
 	peridotpb "peridot.resf.org/peridot/pb"
 	"peridot.resf.org/utils"
-	"strings"
-	"time"
 )
 
 var (
 	ErrUnsupportedExtension = errors.New("unsupported extension")
 )
+
+func (s *Server) checksigRPM(key *LoadedKey, rpmPath string) ([]byte, error) {
+	opts := []string{
+		"--define", "_gpg_name " + key.gpgId,
+		"--define", "_peridot_keykeeper_key " + key.keyUuid.String(),
+		"--checksig", rpmPath,
+	}
+	cmd := s.gpgCmdEnv(exec.Command("rpm", opts...))
+	out, err := cmd.CombinedOutput()
+	return out, err
+}
+
+func (s *Server) signRPM(key *LoadedKey, rpmPath string) ([]byte, error) {
+	opts := []string{
+		"--define", "_gpg_name " + key.gpgId,
+		"--define", "_peridot_keykeeper_key " + key.keyUuid.String(),
+		"--addsign", rpmPath,
+	}
+	cmd := s.gpgCmdEnv(exec.Command("rpm", opts...))
+	out, err := cmd.CombinedOutput()
+	return out, err
+}
 
 func (s *Server) SignArtifactsWorkflow(ctx workflow.Context, artifacts models.TaskArtifacts, buildId string, task *models.Task, keyName string) (*keykeeperpb.SignArtifactsTask, error) {
 	taskResponse := &keykeeperpb.SignArtifactsTask{
@@ -131,9 +152,7 @@ func (s *Server) SignArtifactsWorkflow(ctx workflow.Context, artifacts models.Ta
 			s.log.Errorf("could not get sign artifact: %v", err)
 			return nil, err
 		}
-		if signedArtifact != nil {
-			taskResponse.SignedArtifacts = append(taskResponse.SignedArtifacts, signedArtifact)
-		}
+		taskResponse.SignedArtifacts = append(taskResponse.SignedArtifacts, signedArtifact)
 	}
 
 	task.Status = peridotpb.TaskStatus_TASK_STATUS_SUCCEEDED
@@ -155,7 +174,7 @@ func (s *Server) SignArtifactActivity(ctx context.Context, artifactId string, ke
 		return nil, status.Errorf(codes.Internal, "could not get artifact")
 	}
 
-	key, err := s.EnsureGPGKey(keyName)
+	key, err := s.keykeeperServer.EnsureGPGKey(keyName)
 	if err != nil {
 		s.log.Errorf("failed to load key %s: %v", keyName, err)
 		return nil, status.Error(codes.Internal, "failed to load key")
@@ -175,7 +194,7 @@ func (s *Server) SignArtifactActivity(ctx context.Context, artifactId string, ke
 	}
 
 	ranUuid := uuid.New()
-	localPath := fmt.Sprintf("/keykeeper/artifacts/%s-%s", ranUuid.String(), filepath.Base(artifact.Name))
+	localPath := fmt.Sprintf(s.workingDir+"/keykeeper/artifacts/%s-%s", ranUuid.String(), filepath.Base(artifact.Name))
 	err = s.storage.DownloadObject(artifact.Name, localPath)
 	if err != nil {
 		s.log.Errorf("failed to download artifact %s: %v", artifact.Name, err)
@@ -196,16 +215,7 @@ func (s *Server) SignArtifactActivity(ctx context.Context, artifactId string, ke
 		tx := s.db.UseTransaction(beginTx)
 
 		rpmSign := func() (*keykeeperpb.SignedArtifact, error) {
-			var outBuf bytes.Buffer
-			opts := []string{
-				"--define", "_gpg_name " + keyName,
-				"--define", "_peridot_keykeeper_key " + key.keyUuid.String(),
-				"--addsign", localPath,
-			}
-			cmd := gpgCmdEnv(exec.Command("rpm", opts...))
-			cmd.Stdout = &outBuf
-			cmd.Stderr = &outBuf
-			err := cmd.Run()
+			output, err := s.signRPM(key, localPath)
 			if err != nil {
 				s.log.Errorf("failed to sign artifact %s: %v", artifact.Name, err)
 				statusErr := status.New(codes.Internal, "failed to sign artifact")
@@ -213,7 +223,7 @@ func (s *Server) SignArtifactActivity(ctx context.Context, artifactId string, ke
 					Reason: "rpmsign-failed",
 					Domain: "keykeeper.peridot.resf.org",
 					Metadata: map[string]string{
-						"logs": outBuf.String(),
+						"logs": string(output),
 						"err":  err.Error(),
 					},
 				})
@@ -259,19 +269,10 @@ func (s *Server) SignArtifactActivity(ctx context.Context, artifactId string, ke
 			}, nil
 		}
 		verifySig := func() error {
-			var outBuf bytes.Buffer
-			opts := []string{
-				"--define", "_gpg_name " + keyName,
-				"--define", "_peridot_keykeeper_key " + key.keyUuid.String(),
-				"--checksig", localPath,
-			}
-			cmd := gpgCmdEnv(exec.Command("rpm", opts...))
-			cmd.Stdout = &outBuf
-			cmd.Stderr = &outBuf
-			err := cmd.Run()
+			output, err := s.checksigRPM(key, localPath)
 			if err != nil {
 				s.log.Errorf("failed to verify artifact %s: %v", artifact.Name, err)
-				s.log.Errorf("buf: %s", outBuf.String())
+				s.log.Errorf("buf: %s", string(output))
 				return fmt.Errorf("failed to verify artifact %s: %v", artifact.Name, err)
 			}
 			return nil
@@ -384,10 +385,50 @@ func (s *Server) SignArtifacts(_ context.Context, req *keykeeperpb.SignArtifacts
 	}, nil
 }
 
+func (s *Server) SignRPM(ctx context.Context, req *keykeeperpb.SignRPMRequest) (*keykeeperpb.SignRPMResponse, error) {
+	key, err := s.keykeeperServer.EnsureGPGKey(req.KeyName)
+	if err != nil {
+		s.log.Errorf("failed to load key %s: %v", req.KeyName, err)
+		return nil, status.Error(codes.Internal, "failed to load key")
+	}
+
+	tmpFile, err := os.CreateTemp("", "kkp-sign-*.rpm")
+	if err != nil {
+		s.log.Errorf("failed to create temp file: %v", err)
+		return nil, status.Error(codes.Internal, "failed to create temp file")
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+	err = os.WriteFile(tmpFile.Name(), []byte(req.Rpm), 0644)
+	if err != nil {
+		s.log.Errorf("failed to write to temp file: %v", err)
+		return nil, status.Error(codes.Internal, "failed to write to temp file")
+	}
+
+	// Perform the signing operation
+	output, err := s.signRPM(key, tmpFile.Name())
+	if err != nil {
+		s.log.Errorf("failed to sign rpm: %v", err)
+		s.log.Errorf("rpm --sign output: %s", string(output))
+		return nil, status.Errorf(codes.Internal, "failed to sign rpm: %s", err)
+	}
+
+	signedRPMContents, err := os.ReadFile(tmpFile.Name())
+	if err != nil {
+		s.log.Errorf("failed to sign text: %v", err)
+		return nil, status.Error(codes.Internal, "failed to sign text")
+	}
+
+	// Return the signed RPM contents
+	return &keykeeperpb.SignRPMResponse{
+		SignedRpm: signedRPMContents,
+	}, nil
+}
+
 // SignText signs given text with the given key.
 // This method only returns the signature part of the gpg clearsign
 func (s *Server) SignText(_ context.Context, req *keykeeperpb.SignTextRequest) (*keykeeperpb.SignTextResponse, error) {
-	key, err := s.EnsureGPGKey(req.KeyName)
+	key, err := s.keykeeperServer.EnsureGPGKey(req.KeyName)
 	if err != nil {
 		s.log.Errorf("failed to load key %s: %v", req.KeyName, err)
 		return nil, status.Error(codes.Internal, "failed to load key")
@@ -400,7 +441,7 @@ func (s *Server) SignText(_ context.Context, req *keykeeperpb.SignTextRequest) (
 	}
 	defer os.Remove(tmpFile.Name())
 	defer tmpFile.Close()
-	err = ioutil.WriteFile(tmpFile.Name(), []byte(req.Text), 0644)
+	err = os.WriteFile(tmpFile.Name(), []byte(req.Text), 0644)
 	if err != nil {
 		s.log.Errorf("failed to write to temp file: %v", err)
 		return nil, status.Error(codes.Internal, "failed to write to temp file")
@@ -416,12 +457,12 @@ func (s *Server) SignText(_ context.Context, req *keykeeperpb.SignTextRequest) (
 		"--passphrase",
 		key.keyUuid.String(),
 		"-u",
-		req.KeyName,
+		key.gpgId,
 		"-o",
 		tmpFile.Name() + ".asc",
 		tmpFile.Name(),
 	}
-	cmd := gpgCmdEnv(exec.Command("gpg", cmdArgs...))
+	cmd := s.gpgCmdEnv(exec.Command("gpg", cmdArgs...))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err = cmd.Run()
@@ -430,7 +471,7 @@ func (s *Server) SignText(_ context.Context, req *keykeeperpb.SignTextRequest) (
 		return nil, status.Error(codes.Internal, "failed to sign text")
 	}
 	defer os.Remove(tmpFile.Name() + ".asc")
-	signedText, err := ioutil.ReadFile(tmpFile.Name() + ".asc")
+	signedText, err := os.ReadFile(tmpFile.Name() + ".asc")
 	if err != nil {
 		s.log.Errorf("failed to read signed text: %v", err)
 		return nil, status.Error(codes.Internal, "failed to read signed text")

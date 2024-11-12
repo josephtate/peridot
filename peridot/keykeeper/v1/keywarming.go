@@ -36,15 +36,15 @@ import (
 	"crypto/cipher"
 	"encoding/hex"
 	"fmt"
-	"github.com/ProtonMail/gopenpgp/v2/crypto"
-	"github.com/google/uuid"
-	"io/ioutil"
 	"os"
 	"os/exec"
-	"peridot.resf.org/peridot/db/models"
-	"peridot.resf.org/utils"
 	"strings"
 	"sync"
+
+	"github.com/ProtonMail/gopenpgp/v2/crypto"
+	"github.com/google/uuid"
+	"peridot.resf.org/peridot/db/models"
+	"peridot.resf.org/utils"
 )
 
 // LoadedKey keeps the key and some other information in memory
@@ -62,13 +62,16 @@ func logCmdRun(cmd *exec.Cmd) (*bytes.Buffer, error) {
 	return &outBuf, cmd.Run()
 }
 
-func gpgCmdEnv(cmd *exec.Cmd) *exec.Cmd {
-	cmd.Env = append(cmd.Env, "GNUPGHOME=/keykeeper/gpg")
+func (s *Server) gpgCmdEnv(cmd *exec.Cmd) *exec.Cmd {
+	if s.workingDir != "" {
+		cmd.Env = append(cmd.Env, "HOME="+s.workingDir)
+	}
+	cmd.Env = append(cmd.Env, fmt.Sprintf("GNUPGHOME=%s/keykeeper/gpg", s.workingDir))
 	return cmd
 }
 
 func (s *Server) importGpgKey(armoredKey string) error {
-	cmd := gpgCmdEnv(exec.Command("gpg", "--batch", "--yes", "--import", "-"))
+	cmd := s.gpgCmdEnv(exec.Command("gpg", "--batch", "--yes", "--import", "-"))
 	cmd.Stdin = strings.NewReader(armoredKey)
 	out, err := logCmdRun(cmd)
 	if err != nil {
@@ -78,7 +81,7 @@ func (s *Server) importGpgKey(armoredKey string) error {
 }
 
 func (s *Server) importRpmKey(publicKey string) error {
-	tmpFile, err := ioutil.TempFile("/tmp", "peridot-key-")
+	tmpFile, err := os.CreateTemp(s.workingDir+"/tmp", "peridot-key-")
 	if err != nil {
 		return err
 	}
@@ -87,7 +90,7 @@ func (s *Server) importRpmKey(publicKey string) error {
 	if err != nil {
 		return err
 	}
-	cmd := gpgCmdEnv(exec.Command("rpm", "--import", tmpFile.Name()))
+	cmd := s.gpgCmdEnv(exec.Command("rpm", "--import", tmpFile.Name()))
 	out, err := logCmdRun(cmd)
 	if err != nil {
 		s.log.Errorf("failed to import rpm key: %s", out.String())
@@ -152,25 +155,25 @@ func (s *Server) EnsureGPGKey(key string) (*LoadedKey, error) {
 	}
 	encryptedArmoredKeyHex, err := store.Get(k.ExtStoreId)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get key armor: %w", err)
 	}
 	encryptedArmoredKey, err := hex.DecodeString(encryptedArmoredKeyHex)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to decode key: %w", err)
 	}
 
 	// Decrypt the key
 	block, err := aes.NewCipher(encBytes)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create cipher: %w", err)
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create gcm: %w", err)
 	}
 	armoredKey, err := gcm.Open(nil, nonce, encryptedArmoredKey, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open gcm key: %w", err)
 	}
 	keyObj, err := crypto.NewKeyFromArmored(string(armoredKey))
 	if err != nil {
@@ -180,7 +183,7 @@ func (s *Server) EnsureGPGKey(key string) (*LoadedKey, error) {
 
 	loadedKey, err := s.WarmGPGKey(key, string(armoredKey), keyObj, k)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to warm gpg key: %w", err)
 	}
 
 	return loadedKey, nil
